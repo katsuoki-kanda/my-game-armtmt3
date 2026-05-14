@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Game Online - Circle Optimized</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: sans-serif; }
+        #container { position: relative; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+        video { transform: scaleX(-1); display: none; }
+        /* canvasのCSSでの引き伸ばしをやめ、JSでサイズ制御します */
+        canvas { position: absolute; top: 0; left: 0; transform: scaleX(-1); }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; transform: none; z-index: 10; }
+        
+        .overlay-text { position: absolute; color: #0f0; font-size: 36px; text-shadow: 2px 2px 4px #000; font-weight: bold; }
+        
+        #score-board { top: 20px; left: 20px; }
+        #timer-board { top: 20px; right: 20px; color: #fff; }
+        #msg-center { top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 40px; text-align: center; color: #0f0; }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <video id="input_video"></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="ui-layer">
+        <div id="score-board" class="overlay-text">Score: 0</div>
+        <div id="timer-board" class="overlay-text">Time: 60</div>
+        <div id="msg-center" class="overlay-text">
+            カメラ起動中...<br>
+            <span style="font-size: 20px; color: #ccc;">(カメラの使用を許可してください)</span>
+        </div>
+    </div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const scoreElement = document.getElementById('score-board');
+    const timerElement = document.getElementById('timer-board');
+    const msgElement = document.getElementById('msg-center');
+
+    let score = 0;
+    let count = 1;
+    let gameStarted = false;
+    let isCoolingDown = false; 
+    let remainingTime = 60;
+    let startTime = 0;
+    let cameraActive = false;
+
+    // 半径の調整
+    const circleRadius = 55;       
+    const fingerRadius = 35; 
+    const fontSize = 60;               
+
+    let circles = [];
+    let audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+    // ビデオ描画用のアスペクト比計算変数
+    let vScale, vOffsetX, vOffsetY;
+
+    function speak(text) {
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        window.speechSynthesis.speak(uttr);
+    }
+
+    function playBeep() {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.frequency.value = 900;
+        gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + 0.1);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+    }
+
+    // キャンバスサイズをウィンドウに合わせる
+    function resizeCanvas() {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+        if (!gameStarted && !isCoolingDown) initCircles();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    function initCircles() {
+        circles = [];
+        let nums = Array.from({length: 10}, (_, i) => i + 1).sort(() => Math.random() - 0.5);
+        let sides = Array.from({length: 10}, () => Math.random() < 0.5 ? 'Left' : 'Right');
+
+        for (let i = 0; i < 10; i++) {
+            const sectionWidth = canvasElement.width / 10;
+            let x, y;
+            let attempts = 0;
+
+            while (attempts < 100) {
+                x = (i * sectionWidth) + (Math.random() * (sectionWidth - circleRadius * 2)) + circleRadius;
+                y = Math.random() * (canvasElement.height - 250) + 125;
+                
+                // UI回避 (Score/Timerエリア)
+                const avoidWidth = 350;
+                const avoidHeight = 150;
+                const isScoreArea = (x > canvasElement.width - avoidWidth && y < avoidHeight);
+                const isTimerArea = (x < avoidWidth && y < avoidHeight);
+                
+                const isOverlapping = circles.some(c => {
+                    const d = Math.sqrt((x - c.x)**2 + (y - c.y)**2);
+                    return d < circleRadius * 2.2;
+                });
+
+                if (!isScoreArea && !isTimerArea && !isOverlapping) break;
+                attempts++;
+            }
+            circles.push({ x: x, y: y, num: nums[i], handType: sides[i], cleared: false });
+        }
+    }
+
+    function onResults(results) {
+        if (!cameraActive) {
+            cameraActive = true;
+            msgElement.innerHTML = "手を高く挙げてスタート<br><span style='font-size: 20px; color: #ff0;'>(Escキーで終了 / Fキーで全画面)</span>";
+        }
+
+        // ビデオのアスペクト比を維持してキャンバスいっぱいに描画する計算 (object-fit: cover)
+        const vW = videoElement.videoWidth;
+        const vH = videoElement.videoHeight;
+        const cW = canvasElement.width;
+        const cH = canvasElement.height;
+        
+        vScale = Math.max(cW / vW, cH / vH);
+        vOffsetX = (cW - vW * vScale) / 2;
+        vOffsetY = (cH - vH * vScale) / 2;
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, cW, cH);
+        
+        // 背景ビデオの描画
+        canvasCtx.drawImage(results.image, vOffsetX, vOffsetY, vW * vScale, vH * vScale);
+
+        if (results.multiHandLandmarks && results.multiHandedness) {
+            for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                const landmarks = results.multiHandLandmarks[i];
+                const handLabel = results.multiHandedness[i].label; 
+                
+                // 座標変換：正規化座標(0-1)を背景ビデオの描画位置に合わせる
+                const x = (landmarks[8].x * vW * vScale) + vOffsetX;
+                const y = (landmarks[8].y * vH * vScale) + vOffsetY;
+
+                // スタート判定
+                if (!gameStarted && !isCoolingDown && landmarks[8].y < 0.2) {
+                    startGame();
+                }
+
+                // 指の丸（正円）
+                canvasCtx.beginPath();
+                canvasCtx.arc(x, y, fingerRadius, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = (handLabel === 'Left') ? 'rgba(255, 0, 0, 0.7)' : 'rgba(0, 0, 255, 0.7)';
+                canvasCtx.fill();
+                canvasCtx.strokeStyle = 'white';
+                canvasCtx.lineWidth = 3;
+                canvasCtx.stroke();
+
+                if (gameStarted) checkHit(x, y, handLabel);
+            }
+        }
+
+        if (gameStarted) {
+            updateGame();
+            drawCircles();
+        }
+        canvasCtx.restore();
+    }
+
+    function startGame() {
+        if (gameStarted) return;
+        gameStarted = true;
+        score = 0;
+        count = 1;
+        remainingTime = 60;
+        startTime = Date.now();
+        msgElement.innerHTML = "";
+        speak("スタート");
+        initCircles();
+    }
+
+    function updateGame() {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        remainingTime = Math.max(0, 60 - elapsed);
+        timerElement.innerText = `Time: ${remainingTime}`;
+        scoreElement.innerText = `Score: ${score}`;
+        if (remainingTime <= 0) endGame();
+    }
+
+    function endGame() {
+        gameStarted = false;
+        isCoolingDown = true;
+        circles = []; 
+        speak(`${score}点です。終了`);
+        let cooldownSec = 3;
+        const updateCooldownMsg = () => {
+            if (cooldownSec > 0) {
+                msgElement.innerHTML = `終了！ Score: ${score}<br><span style="font-size:24px; color: #ff9;">次の開始まで ${cooldownSec} 秒...</span>`;
+                cooldownSec--;
+                setTimeout(updateCooldownMsg, 1000);
+            } else {
+                isCoolingDown = false;
+                msgElement.innerHTML = `終了！ Score: ${score}<br><span style="font-size:24px; color: #0f0;">手を挙げて再挑戦</span>`;
+            }
+        };
+        updateCooldownMsg();
+    }
+
+    function checkHit(hx, hy, handLabel) {
+        circles.forEach(c => {
+            if (!c.cleared && c.num === count && c.handType === handLabel) {
+                const dist = Math.sqrt((hx - c.x) ** 2 + (hy - c.y) ** 2);
+                if (dist < (circleRadius + fingerRadius * 0.5)) {
+                    c.cleared = true;
+                    score++;
+                    count++;
+                    playBeep();
+                    if (count > 10) { initCircles(); count = 1; }
+                }
+            }
+        });
+    }
+
+    function drawCircles() {
+        circles.forEach(c => {
+            if (c.cleared) return;
+            // ターゲットの円（正円）
+            canvasCtx.beginPath();
+            canvasCtx.arc(c.x, c.y, circleRadius, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = (c.handType === 'Left') ? 'red' : 'blue';
+            canvasCtx.fill();
+            
+            // 数字の描画（反転対応）
+            canvasCtx.save();
+            canvasCtx.translate(c.x, c.y);
+            canvasCtx.scale(-1, 1); 
+            canvasCtx.fillStyle = "#fff";
+            canvasCtx.font = `bold ${fontSize}px Arial`;
+            canvasCtx.textAlign = "center";
+            canvasCtx.textBaseline = "middle";
+            canvasCtx.fillText(c.num, 0, 2); 
+            canvasCtx.restore();
+        });
+    }
+
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 1280, height: 720
+    });
+    camera.start();
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' || e.key === 'q') speak("やめます");
+        if (e.key === 'f') {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().then(() => resizeCanvas());
+            } else {
+                document.exitFullscreen().then(() => resizeCanvas());
+            }
+        }
+    });
+</script>
+</body>
+</html>
